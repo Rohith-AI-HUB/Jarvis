@@ -1,0 +1,48 @@
+{
+  "version": 2,
+  "updated_at": "2026-04-12T22:27:55.810660+00:00",
+  "last_write": {
+    "category": "preferences",
+    "key": "instruction_open_youtube"
+  },
+  "user_profile": {
+    "preferred_name": {
+      "value": "Rohit",
+      "source": "my name is rohit",
+      "category": "user_profile",
+      "confidence": "explicit",
+      "created_at": "2026-04-12T18:06:18.337423+00:00",
+      "updated_at": "2026-04-12T18:06:18.337423+00:00"
+    }
+  },
+  "assistant_identity": {},
+  "preferences": {
+    "voice_replies": {
+      "value": "fully local",
+      "source": "I want fully local voice replies and natural conversation.",
+      "category": "preferences",
+      "confidence": "explicit",
+      "created_at": "2026-04-12T17:56:44.036586+00:00",
+      "updated_at": "2026-04-12T17:56:44.036586+00:00"
+    },
+    "conversation_style": {
+      "value": "natural give-and-take",
+      "source": "I want fully local voice replies and natural conversation.",
+      "category": "preferences",
+      "confidence": "explicit",
+      "created_at": "2026-04-12T17:56:44.036608+00:00",
+      "updated_at": "2026-04-12T17:56:44.036608+00:00"
+    },
+    "instruction_open_youtube": {
+      "value": "open youtube",
+      "source": "i want you to open youtube",
+      "category": "preferences",
+      "confidence": "explicit",
+      "created_at": "2026-04-12T22:27:55.810660+00:00",
+      "updated_at": "2026-04-12T22:27:55.810660+00:00"
+    }
+  },
+  "projects": {},
+  "corrections": {},
+  "facts": {}
+}
