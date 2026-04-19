@@ -1,24 +1,31 @@
 from __future__ import annotations
 
+import ctypes
+from ctypes import wintypes
 import logging
 import math
-import random
 import threading
 import time
+from dataclasses import dataclass
 from typing import Any, Callable
 
 import tkinter as tk
 
 from interface.theme import STATE_VISUALS, TOKENS
-
-BG = "#010208"
-TEXT_PRI = TOKENS["text_primary"]
-TEXT_SEC = TOKENS["text_secondary"]
-LEFT_WAVE = "#54c7ff"
-RIGHT_WAVE = "#f05cff"
-CORE_FILL = "#08101d"
+from system.config import settings
 
 LOGGER = logging.getLogger(__name__)
+
+BG = TOKENS["bg"]
+TEXT_PRI = TOKENS["text_primary"]
+TEXT_SEC = "#c7d6f5"
+TRANSPARENT_KEY = "#010101"
+EDGE_BG_DEBUG = "#13233d"
+
+GWL_EXSTYLE = -20
+WS_EX_LAYERED = 0x00080000
+WS_EX_TRANSPARENT = 0x00000020
+LWA_COLORKEY = 0x00000001
 
 
 def _lerp(a: float, b: float, t: float) -> float:
@@ -34,10 +41,17 @@ def _lerp_color(c1: str, c2: str, t: float) -> str:
     return f"#{r:02x}{g:02x}{b:02x}"
 
 
+def _to_colorref(color: str) -> int:
+    r = int(color[1:3], 16)
+    g = int(color[3:5], 16)
+    b = int(color[5:7], 16)
+    return r | (g << 8) | (b << 16)
+
+
 class AnimatedValue:
     __slots__ = ("value", "target", "speed")
 
-    def __init__(self, initial: float, target: float = 0.0, speed: float = 0.12) -> None:
+    def __init__(self, initial: float, target: float = 0.0, speed: float = 0.15) -> None:
         self.value = initial
         self.target = target
         self.speed = speed
@@ -56,7 +70,7 @@ class ColorAnimator:
     def __init__(self, accent: str, glow: str) -> None:
         self.accent = accent
         self.glow = glow
-        self._speed = 0.08
+        self._speed = 0.10
 
     def update(self, accent: str, glow: str) -> tuple[str, str]:
         self.accent = _lerp_color(self.accent, accent, self._speed)
@@ -64,77 +78,100 @@ class ColorAnimator:
         return self.accent, self.glow
 
 
-class OrbitParticle:
-    __slots__ = ("angle", "speed", "radius", "size", "color")
-
-    def __init__(self, angle: float, speed: float, radius: float, size: float, color: str) -> None:
-        self.angle = angle
-        self.speed = speed
-        self.radius = radius
-        self.size = size
-        self.color = color
-
-    def step(self, cx: float, cy: float, energy: float) -> tuple[float, float, float]:
-        self.angle += self.speed + energy * 0.01
-        radius = self.radius + energy * 18
-        x = cx + math.cos(self.angle) * radius
-        y = cy + math.sin(self.angle) * radius
-        return x, y, self.size + energy * 1.5
+@dataclass(slots=True)
+class _MonitorSpec:
+    left: int
+    top: int
+    width: int
+    height: int
 
 
-class AssistantHud:
-    WIN_W = 980
-    WIN_H = 420
-    CX = WIN_W // 2
-    CY = WIN_H // 2 - 18
-    ORB_R = 74
-    WAVE_COUNT = 28
+@dataclass(slots=True)
+class _EdgeSpec:
+    side: str
+    x: int
+    y: int
+    width: int
+    height: int
+    monitor_index: int = 0
+
+
+@dataclass(slots=True)
+class _EdgeWindow:
+    window: tk.Toplevel
+    canvas: tk.Canvas
+    side: str
+    monitor_index: int
+
+
+class EdgeAuraHud:
+    EDGE_THICKNESS = max(20, settings.hud_edge_thickness)
+    EDGE_PADDING = 0
+    EDGE_INSET = max(4, settings.hud_edge_inset)
+    FRAME_DELAY_MS = 33
+    GLOW_SEGMENT_COUNT = 88
+    CLICK_THROUGH_MAX_RETRIES = 5
+    CLICK_THROUGH_RETRY_DELAY_MS = 200
 
     def __init__(self) -> None:
         self._state = "idle_ready"
         self._detail_text = "Jarvis ready"
         self._running = False
         self._root: tk.Tk | None = None
-        self._canvas: tk.Canvas | None = None
+        self._edges: list[_EdgeWindow] = []
         self._control_center_factory: Callable[[tk.Tk], Any] | None = None
         self._control_center: Any | None = None
         self._control_center_requested = False
         self._lock = threading.Lock()
 
         idle_visual = STATE_VISUALS["idle_ready"]
-        self._audio_level = AnimatedValue(0.0, 0.0, 0.2)
-        self._pulse = AnimatedValue(0.0, 0.0, 0.14)
-        self._orb_scale = AnimatedValue(1.0, 1.0, 0.12)
+        self._audio_level = AnimatedValue(0.0, 0.0, 0.22)
+        self._energy = AnimatedValue(0.12, 0.12, 0.12)
+        self._presence = AnimatedValue(0.06, 0.06, 0.10)
         self._color_anim = ColorAnimator(idle_visual.accent, idle_visual.glow)
         self._startup_started_at = time.perf_counter()
-        self._startup_duration_s = 0.9
-        self._completion_resonance_until = 0.0
-        self._recent_audio_peak = 0.0
+        self._startup_duration_s = max(1.0, settings.hud_startup_pulse_seconds)
         self._phase = 0.0
-        self._frame_delay_ms = 33
-        self._last_frame_started = time.perf_counter()
+        self._corner_phase = 0.0
+        self._recent_audio_peak = 0.0
+        self._click_through_applied = False
 
-        self._drag_x = 0
-        self._drag_y = 0
-        self._win_x = 0
-        self._win_y = 0
+    @classmethod
+    def edge_specs_for_screen(cls, screen_width: int, screen_height: int) -> list[_EdgeSpec]:
+        return cls.edge_specs_for_monitor(0, 0, screen_width, screen_height, monitor_index=0)
 
-        self._particles = self._init_particles()
-
-    def _init_particles(self) -> list[OrbitParticle]:
-        palette = [LEFT_WAVE, RIGHT_WAVE, "#ffffff", _lerp_color(LEFT_WAVE, RIGHT_WAVE, 0.5)]
-        particles: list[OrbitParticle] = []
-        for idx in range(18):
-            particles.append(
-                OrbitParticle(
-                    angle=(2 * math.pi / 18) * idx,
-                    speed=0.012 + (idx % 3) * 0.004,
-                    radius=self.ORB_R + 18 + (idx % 4) * 10,
-                    size=1.8 + (idx % 2),
-                    color=palette[idx % len(palette)],
-                )
-            )
-        return particles
+    @classmethod
+    def edge_specs_for_monitor(
+        cls,
+        left: int,
+        top: int,
+        screen_width: int,
+        screen_height: int,
+        monitor_index: int = 0,
+    ) -> list[_EdgeSpec]:
+        thickness = cls.EDGE_THICKNESS
+        width = screen_width - cls.EDGE_PADDING * 2
+        height = screen_height - cls.EDGE_PADDING * 2
+        return [
+            _EdgeSpec("top", left + cls.EDGE_PADDING, top + cls.EDGE_PADDING, width, thickness, monitor_index),
+            _EdgeSpec(
+                "bottom",
+                left + cls.EDGE_PADDING,
+                top + screen_height - thickness - cls.EDGE_PADDING,
+                width,
+                thickness,
+                monitor_index,
+            ),
+            _EdgeSpec("left", left + cls.EDGE_PADDING, top + cls.EDGE_PADDING, thickness, height, monitor_index),
+            _EdgeSpec(
+                "right",
+                left + screen_width - thickness - cls.EDGE_PADDING,
+                top + cls.EDGE_PADDING,
+                thickness,
+                height,
+                monitor_index,
+            ),
+        ]
 
     def start(self) -> None:
         if self._running:
@@ -159,13 +196,16 @@ class AssistantHud:
             self._state = "idle_ready"
             self._detail_text = "Jarvis ready"
             self._audio_level.snap(0.0)
-            self._pulse.snap(0.0)
+            self._energy.snap(0.10)
+            self._presence.snap(0.04)
 
     def on_wake_detected(self) -> None:
         with self._lock:
             self._state = "idle_ready"
             self._detail_text = "Wake detected"
-            self._pulse.snap(1.0)
+            self._audio_level.snap(0.0)
+            self._energy.snap(0.42)
+            self._presence.snap(0.24)
 
     def on_listening(self, level: float) -> None:
         with self._lock:
@@ -173,34 +213,42 @@ class AssistantHud:
             self._detail_text = "Listening"
             clamped = max(0.0, min(1.0, level))
             self._audio_level.snap(clamped)
-            self._recent_audio_peak = max(self._recent_audio_peak * 0.9, clamped)
+            self._energy.snap(0.58 + clamped * 0.30)
+            self._presence.snap(0.42 + clamped * 0.24)
+            self._recent_audio_peak = max(self._recent_audio_peak * 0.90, clamped)
 
     def on_thinking(self) -> None:
         with self._lock:
             self._state = "thinking"
             self._detail_text = "Processing"
-            self._audio_level.snap(0.18)
+            self._audio_level.snap(0.0)
+            self._energy.snap(0.54)
+            self._presence.snap(0.34)
 
     def on_confirmation(self, prompt: str) -> None:
         with self._lock:
             self._state = "confirmation_needed"
-            self._detail_text = (prompt.strip() or "Please confirm")[:64]
-            self._audio_level.snap(0.12)
+            self._detail_text = (prompt.strip() or "Please confirm")[:72]
+            self._audio_level.snap(0.0)
+            self._energy.snap(0.66)
+            self._presence.snap(0.44)
 
     def on_error(self, message: str) -> None:
         with self._lock:
             self._state = "error"
-            self._detail_text = (message.strip() or "Something went wrong")[:64]
-            self._audio_level.snap(0.3)
+            self._detail_text = (message.strip() or "Something went wrong")[:72]
+            self._audio_level.snap(0.0)
+            self._energy.snap(0.95)
+            self._presence.snap(0.62)
 
     def on_complete(self, result: str) -> None:
         del result
         with self._lock:
             self._state = "complete"
             self._detail_text = "Objective complete"
-            self._audio_level.snap(0.08)
-            self._pulse.snap(1.0)
-            self._completion_resonance_until = time.perf_counter() + 1.4
+            self._audio_level.snap(0.0)
+            self._energy.snap(0.48)
+            self._presence.snap(0.28)
 
     def set_state(self, state: str, text: str | None = None) -> None:
         mapping = {
@@ -214,57 +262,144 @@ class AssistantHud:
         with self._lock:
             self._state = mapping.get(state, "idle_ready")
             if text:
-                self._detail_text = text[:64]
+                self._detail_text = text[:72]
 
     def set_audio_level(self, level: float) -> None:
         with self._lock:
-            self._audio_level.snap(max(0.0, min(1.0, level)))
+            clamped = max(0.0, min(1.0, level))
+            self._audio_level.snap(clamped)
+            self._energy.snap(max(self._energy.target, 0.30 + clamped * 0.45))
+            self._presence.snap(max(self._presence.target, 0.18 + clamped * 0.28))
 
     def _run(self) -> None:
         try:
             root = tk.Tk()
             self._root = root
-            root.overrideredirect(True)
-            root.attributes("-topmost", True)
-            root.attributes("-alpha", 0.99)
-            root.config(bg=BG)
-
-            sw = root.winfo_screenwidth()
-            sh = root.winfo_screenheight()
-            self._win_x = (sw - self.WIN_W) // 2
-            self._win_y = (sh - self.WIN_H) // 2
-            root.geometry(f"{self.WIN_W}x{self.WIN_H}+{self._win_x}+{self._win_y}")
-            root.deiconify()
-
-            self._canvas = tk.Canvas(root, width=self.WIN_W, height=self.WIN_H, bg=BG, highlightthickness=0, bd=0)
-            self._canvas.pack(fill="both", expand=True)
-            self._canvas.bind("<ButtonPress-1>", self._drag_start)
-            self._canvas.bind("<B1-Motion>", self._drag_motion)
-            self._canvas.bind("<Double-Button-1>", lambda _e: self.request_control_center())
-
+            root.withdraw()
+            root.configure(bg=BG)
+            self._create_edge_windows(root)
+            root.update_idletasks()
+            root.update()
+            self._apply_click_through()
             self._animate()
             root.mainloop()
         except Exception:
-            LOGGER.exception("Overlay runtime failed.")
+            LOGGER.exception("Edge HUD runtime failed.")
         finally:
             self._running = False
             self._root = None
-            self._canvas = None
+            self._edges = []
 
-    def _drag_start(self, event: tk.Event) -> None:
-        self._drag_x = event.x_root
-        self._drag_y = event.y_root
+    def _get_monitor_specs(self, root: tk.Tk) -> list[_MonitorSpec]:
+        monitors: list[_MonitorSpec] = []
 
-    def _drag_motion(self, event: tk.Event) -> None:
-        if not self._root:
-            return
-        dx = event.x_root - self._drag_x
-        dy = event.y_root - self._drag_y
-        self._drag_x = event.x_root
-        self._drag_y = event.y_root
-        self._win_x += dx
-        self._win_y += dy
-        self._root.geometry(f"+{self._win_x}+{self._win_y}")
+        callback_type = ctypes.WINFUNCTYPE(
+            ctypes.c_int,
+            wintypes.HMONITOR,
+            wintypes.HDC,
+            ctypes.POINTER(wintypes.RECT),
+            wintypes.LPARAM,
+        )
+
+        def _callback(
+            h_monitor: wintypes.HMONITOR,
+            hdc_monitor: wintypes.HDC,
+            rect_ptr: ctypes.POINTER(wintypes.RECT),
+            dw_data: wintypes.LPARAM,
+        ) -> int:
+            del h_monitor, hdc_monitor, dw_data
+            rect = rect_ptr.contents
+            monitors.append(_MonitorSpec(rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top))
+            return 1
+
+        try:
+            success = ctypes.windll.user32.EnumDisplayMonitors(None, None, callback_type(_callback), 0)
+            if success and monitors:
+                return monitors
+        except Exception:
+            LOGGER.debug("Failed to enumerate all monitors for Edge HUD.", exc_info=True)
+
+        return [_MonitorSpec(0, 0, root.winfo_screenwidth(), root.winfo_screenheight())]
+
+    def _create_edge_windows(self, root: tk.Tk) -> None:
+        monitor_specs = self._get_monitor_specs(root)
+        LOGGER.info("Edge HUD monitor count: %s", len(monitor_specs))
+        for monitor_index, monitor in enumerate(monitor_specs):
+            LOGGER.info(
+                "Edge HUD monitor detected: index=%s geometry=%sx%s+%s+%s",
+                monitor_index,
+                monitor.width,
+                monitor.height,
+                monitor.left,
+                monitor.top,
+            )
+            for spec in self.edge_specs_for_monitor(
+                monitor.left,
+                monitor.top,
+                monitor.width,
+                monitor.height,
+                monitor_index=monitor_index,
+            ):
+                bg_color = EDGE_BG_DEBUG if settings.hud_debug_visible else TRANSPARENT_KEY
+                window = tk.Toplevel(root)
+                window.overrideredirect(True)
+                window.attributes("-topmost", True)
+                window.attributes("-alpha", 0.98)
+                window.configure(bg=bg_color)
+                window.geometry(f"{spec.width}x{spec.height}+{spec.x}+{spec.y}")
+                canvas = tk.Canvas(
+                    window,
+                    width=spec.width,
+                    height=spec.height,
+                    bg=bg_color,
+                    highlightthickness=0,
+                    bd=0,
+                )
+                canvas.pack(fill="both", expand=True)
+                self._edges.append(
+                    _EdgeWindow(window=window, canvas=canvas, side=spec.side, monitor_index=spec.monitor_index)
+                )
+                LOGGER.info(
+                    "Edge HUD window created: monitor=%s side=%s geometry=%sx%s+%s+%s",
+                    spec.monitor_index,
+                    spec.side,
+                    spec.width,
+                    spec.height,
+                    spec.x,
+                    spec.y,
+                )
+        LOGGER.info("Edge HUD window count: %s", len(self._edges))
+
+    def _apply_click_through(self, attempt: int = 0) -> None:
+        applied = 0
+        transparent_color = _to_colorref(TRANSPARENT_KEY)
+        for edge in self._edges:
+            try:
+                hwnd = edge.window.winfo_id()
+                user32 = ctypes.windll.user32
+                style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+                user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style | WS_EX_LAYERED | WS_EX_TRANSPARENT)
+                user32.SetLayeredWindowAttributes(hwnd, transparent_color, 0, LWA_COLORKEY)
+                applied += 1
+            except Exception:
+                LOGGER.debug(
+                    "Edge HUD click-through unavailable for monitor=%s side=%s.",
+                    edge.monitor_index,
+                    edge.side,
+                    exc_info=True,
+                )
+        self._click_through_applied = applied == len(self._edges)
+        LOGGER.info(
+            "Edge HUD click-through applied to %s/%s windows (attempt %s).",
+            applied,
+            len(self._edges),
+            attempt + 1,
+        )
+        if applied < len(self._edges) and attempt < self.CLICK_THROUGH_MAX_RETRIES and self._root:
+            self._root.after(
+                self.CLICK_THROUGH_RETRY_DELAY_MS,
+                lambda: self._apply_click_through(attempt + 1),
+            )
 
     def _process_control_center_request(self) -> None:
         with self._lock:
@@ -283,8 +418,40 @@ class AssistantHud:
                 self._state = "error"
                 self._detail_text = "Control Center failed"
 
+    def _baseline_strength(self, state: str, startup_t: float) -> float:
+        base = {
+            "idle_ready": 0.018,
+            "listening": 0.16,
+            "thinking": 0.14,
+            "confirmation_needed": 0.18,
+            "error": 0.24,
+            "complete": 0.12,
+        }.get(state, 0.02)
+        startup_pulse = 0.0
+        pulse_window = settings.hud_startup_pulse_seconds
+        if pulse_window > 0:
+            elapsed = time.perf_counter() - self._startup_started_at
+            if elapsed < pulse_window:
+                startup_pulse = (1.0 - (elapsed / pulse_window)) * 0.22
+        if settings.hud_debug_visible:
+            startup_pulse += 0.10
+            base = max(base, 0.08)
+        return min(1.0, base + startup_pulse + startup_t * 0.01)
+
+    def _should_render_text(self, state: str) -> bool:
+        return state in {"confirmation_needed", "error"} and bool(self._detail_text.strip())
+
+    def _phase_for_edge(self, edge: _EdgeWindow, position: float) -> float:
+        side_offset = {
+            "top": 0.0,
+            "right": math.pi * 0.5,
+            "bottom": math.pi,
+            "left": math.pi * 1.5,
+        }[edge.side]
+        return self._phase + self._corner_phase + side_offset + position * math.pi * 2.2
+
     def _animate(self) -> None:
-        if not self._root or not self._canvas:
+        if not self._root:
             return
         if not self._running:
             try:
@@ -300,165 +467,124 @@ class AssistantHud:
             state = self._state
             detail = self._detail_text
             level = self._audio_level.update()
-            self._recent_audio_peak *= 0.98
+            energy = self._energy.update()
+            presence = self._presence.update()
+            self._recent_audio_peak *= 0.96
 
         visual = STATE_VISUALS.get(state, STATE_VISUALS["idle_ready"])
-        now = time.perf_counter()
-        startup_t = max(0.0, min(1.0, (now - self._startup_started_at) / self._startup_duration_s))
-        cur_accent, cur_glow = self._color_anim.update(visual.accent, visual.glow)
-        self._orb_scale.snap(_lerp(0.78, visual.scale, startup_t))
-        scale = self._orb_scale.update()
+        startup_t = max(0.0, min(1.0, (time.perf_counter() - self._startup_started_at) / self._startup_duration_s))
+        accent, glow = self._color_anim.update(visual.accent, visual.glow)
+        baseline = self._baseline_strength(state, startup_t)
+        amplitude = baseline + presence * 0.60 + energy * 0.22 + level * 0.26
+        self._phase += 0.022 + visual.speed * 0.015 + level * 0.05
+        self._corner_phase += 0.008 + visual.speed * 0.006
 
-        c = self._canvas
-        c.delete("all")
-        self._draw_background(c, cur_glow)
-        self._draw_orb(c, cur_accent, cur_glow, scale)
-        self._draw_particles(c, level)
-        self._draw_waveform(c, state, level)
-        self._draw_text_panel(c, cur_accent, visual.label, detail)
+        for edge in self._edges:
+            self._draw_edge(edge, accent, glow, amplitude, baseline, level, detail, state)
 
-        frame_cost_ms = (time.perf_counter() - self._last_frame_started) * 1000.0
-        self._frame_delay_ms = 40 if frame_cost_ms > 40 else 28 if frame_cost_ms < 20 else 33
-        self._last_frame_started = time.perf_counter()
-        self._root.after(self._frame_delay_ms, self._animate)
+        self._root.after(self.FRAME_DELAY_MS, self._animate)
 
-    def _draw_background(self, c: tk.Canvas, glow: str) -> None:
-        c.create_rectangle(0, 0, self.WIN_W, self.WIN_H, fill=BG, outline="")
-        for radius, color in (
-            (300, _lerp_color(LEFT_WAVE, "#081525", 0.7)),
-            (230, _lerp_color(RIGHT_WAVE, "#13061f", 0.7)),
-            (180, glow),
-        ):
-            c.create_oval(self.CX - radius, self.CY - radius, self.CX + radius, self.CY + radius, fill=color, outline="")
+    def _draw_glow_segments(
+        self,
+        canvas: tk.Canvas,
+        edge: _EdgeWindow,
+        accent: str,
+        glow: str,
+        width: int,
+        height: int,
+        inset: int,
+        amplitude: float,
+        baseline: float,
+        state: str,
+        level: float,
+    ) -> None:
+        segments = self.GLOW_SEGMENT_COUNT if edge.side in {"top", "bottom"} else max(48, self.GLOW_SEGMENT_COUNT // 2)
+        inner_line_color = _lerp_color(glow, accent, 0.72)
+        bloom_color = _lerp_color(glow, accent, 0.28)
+        if edge.side in {"top", "bottom"}:
+            center = inset + 2.0 if edge.side == "top" else height - inset - 2.0
+            for idx in range(segments):
+                position = idx / max(1, segments - 1)
+                drift = self._phase_for_edge(edge, position)
+                wave = 0.5 + 0.5 * math.sin(drift)
+                beat = 0.5 + 0.5 * math.sin(drift * 0.48 + self._corner_phase)
+                intensity = max(baseline, min(1.0, amplitude * (0.28 + wave * 0.72)))
+                if state == "listening":
+                    intensity = min(1.0, intensity + level * 0.24 * beat)
+                bloom_height = 3.0 + intensity * 13.0
+                line_height = 1.0 + intensity * 2.8
+                x0 = position * width
+                x1 = min(float(width), x0 + (width / segments) + 1.0)
+                y0 = center - bloom_height
+                y1 = center + bloom_height
+                canvas.create_rectangle(x0, y0, x1, y1, fill=_lerp_color(glow, bloom_color, 0.30 + wave * 0.30), outline="")
+                canvas.create_rectangle(x0, center - line_height, x1, center + line_height, fill=_lerp_color(bloom_color, inner_line_color, 0.45 + wave * 0.45), outline="")
+        else:
+            center = inset + 2.0 if edge.side == "left" else width - inset - 2.0
+            for idx in range(segments):
+                position = idx / max(1, segments - 1)
+                drift = self._phase_for_edge(edge, position)
+                wave = 0.5 + 0.5 * math.sin(drift)
+                beat = 0.5 + 0.5 * math.sin(drift * 0.48 + self._corner_phase)
+                intensity = max(baseline, min(1.0, amplitude * (0.28 + wave * 0.72)))
+                if state == "listening":
+                    intensity = min(1.0, intensity + level * 0.24 * beat)
+                bloom_width = 3.0 + intensity * 13.0
+                line_width = 1.0 + intensity * 2.8
+                y0 = position * height
+                y1 = min(float(height), y0 + (height / segments) + 1.0)
+                x0 = center - bloom_width
+                x1 = center + bloom_width
+                canvas.create_rectangle(x0, y0, x1, y1, fill=_lerp_color(glow, bloom_color, 0.30 + wave * 0.30), outline="")
+                canvas.create_rectangle(center - line_width, y0, center + line_width, y1, fill=_lerp_color(bloom_color, inner_line_color, 0.45 + wave * 0.45), outline="")
 
-        y = self.CY
-        c.create_rectangle(0, y - 1, self.CX - self.ORB_R - 26, y + 1, fill=LEFT_WAVE, outline="")
-        c.create_rectangle(self.CX + self.ORB_R + 26, y - 1, self.WIN_W, y + 1, fill=RIGHT_WAVE, outline="")
+    def _draw_corner_bloom(self, canvas: tk.Canvas, width: int, height: int, accent: str, glow: str, baseline: float) -> None:
+        corner_glow = _lerp_color(glow, accent, 0.38 + baseline * 0.30)
+        spread = 10 + baseline * 30
+        corners = [
+            (0, 0, spread * 2, spread * 2),
+            (width - spread * 2, 0, width, spread * 2),
+            (0, height - spread * 2, spread * 2, height),
+            (width - spread * 2, height - spread * 2, width, height),
+        ]
+        for x0, y0, x1, y1 in corners:
+            canvas.create_oval(x0, y0, x1, y1, fill=corner_glow, outline="")
 
-    def _draw_orb(self, c: tk.Canvas, accent: str, glow: str, scale: float) -> None:
-        orb_r = self.ORB_R * scale
-        pulse = self._pulse.update()
-        pulse_extra = pulse * 12
+    def _draw_edge(
+        self,
+        edge: _EdgeWindow,
+        accent: str,
+        glow: str,
+        amplitude: float,
+        baseline: float,
+        level: float,
+        detail: str,
+        state: str,
+    ) -> None:
+        canvas = edge.canvas
+        canvas.delete("all")
+        width = max(1, canvas.winfo_width())
+        height = max(1, canvas.winfo_height())
+        bg_color = EDGE_BG_DEBUG if settings.hud_debug_visible else TRANSPARENT_KEY
+        canvas.create_rectangle(0, 0, width, height, fill=bg_color, outline="")
 
-        for radius, color in (
-            (orb_r + 34 + pulse_extra, _lerp_color(LEFT_WAVE, RIGHT_WAVE, 0.5)),
-            (orb_r + 20 + pulse_extra, glow),
-            (orb_r + 8, _lerp_color(accent, "#ffffff", 0.15)),
-        ):
-            c.create_oval(self.CX - radius, self.CY - radius, self.CX + radius, self.CY + radius, fill=color, outline="")
+        if settings.hud_debug_visible:
+            debug_color = _lerp_color("#0f1a2d", accent, 0.08)
+            canvas.create_rectangle(0, 0, width, height, fill=debug_color, outline="")
 
-        c.create_oval(self.CX - orb_r, self.CY - orb_r, self.CX + orb_r, self.CY + orb_r, fill=CORE_FILL, outline="")
+        inset = min(self.EDGE_INSET, max(3, min(width, height) // 2))
+        self._draw_corner_bloom(canvas, width, height, accent, glow, baseline)
+        self._draw_glow_segments(canvas, edge, accent, glow, width, height, inset, amplitude, baseline, state, level)
 
-        for radius, color, width in (
-            (orb_r + 8, LEFT_WAVE, 3),
-            (orb_r + 4, _lerp_color(LEFT_WAVE, "#ffffff", 0.35), 2),
-            (orb_r + 1, _lerp_color(LEFT_WAVE, RIGHT_WAVE, 0.45), 2),
-            (orb_r - 2, RIGHT_WAVE, 3),
-        ):
-            c.create_oval(self.CX - radius, self.CY - radius, self.CX + radius, self.CY + radius, fill="", outline=color, width=width)
-
-        c.create_oval(
-            self.CX - orb_r * 0.82,
-            self.CY - orb_r * 0.82,
-            self.CX + orb_r * 0.82,
-            self.CY + orb_r * 0.82,
-            fill="",
-            outline=_lerp_color(accent, "#ffffff", 0.2),
-            width=1,
-        )
-
-        core_r = orb_r * 0.54
-        c.create_oval(self.CX - core_r, self.CY - core_r, self.CX + core_r, self.CY + core_r, fill="#091220", outline="")
-        c.create_oval(
-            self.CX - core_r * 0.2,
-            self.CY - core_r * 0.2,
-            self.CX + core_r * 0.2,
-            self.CY + core_r * 0.2,
-            fill="#ffffff",
-            outline="",
-        )
-
-        reflection_y = self.CY + orb_r + 18
-        for radius, color in (
-            (orb_r * 1.25, _lerp_color(LEFT_WAVE, "#06111d", 0.55)),
-            (orb_r * 1.45, _lerp_color(RIGHT_WAVE, "#140720", 0.55)),
-        ):
-            c.create_arc(
-                self.CX - radius,
-                reflection_y - radius * 0.24,
-                self.CX + radius,
-                reflection_y + radius * 0.24,
-                start=0,
-                extent=180,
-                style="arc",
-                outline=color,
-                width=2,
+        if self._should_render_text(state) and edge.side == "top":
+            canvas.create_text(
+                width / 2,
+                height / 2,
+                anchor="center",
+                text=detail[:56],
+                fill=_lerp_color(TEXT_SEC, TEXT_PRI, 0.35),
+                font=("Segoe UI", 10),
             )
 
-        if time.perf_counter() < self._completion_resonance_until:
-            for idx in range(3):
-                radius = orb_r + 24 + idx * 14 + pulse * 10
-                c.create_oval(
-                    self.CX - radius,
-                    self.CY - radius,
-                    self.CX + radius,
-                    self.CY + radius,
-                    fill="",
-                    outline=_lerp_color(accent, "#ffffff", 0.3 + idx * 0.1),
-                    width=1,
-                )
 
-    def _draw_particles(self, c: tk.Canvas, energy: float) -> None:
-        self._phase += 0.02 + energy * 0.06
-        for particle in self._particles:
-            x, y, size = particle.step(self.CX, self.CY, energy)
-            if random.random() < 0.65:
-                c.create_oval(x - size, y - size, x + size, y + size, fill=particle.color, outline="")
-
-    def _wave_height(self, idx: int, state: str, level: float) -> float:
-        center_bias = 1.0 - (idx / max(1, self.WAVE_COUNT - 1)) ** 1.35
-        base = 8 + center_bias * 26
-        phase = self._phase * 4.5 + idx * 0.58
-        wobble = (math.sin(phase) * 0.5 + 0.5) * 42
-
-        if state == "listening":
-            return base + wobble * (0.65 + level * 1.9)
-        if state == "thinking":
-            return base + wobble * 0.55 + 20
-        if state == "confirmation_needed":
-            return base + wobble * 0.4 + (8 if idx % 4 == 0 else 0)
-        if state == "error":
-            return base + random.random() * 54
-        if state == "complete":
-            return base + wobble * 0.38 + 12
-        return base + wobble * (0.18 + level * 0.35)
-
-    def _draw_waveform(self, c: tk.Canvas, state: str, level: float) -> None:
-        bar_w = 4
-        spacing = 7
-        start_gap = self.ORB_R + 34
-        center_y = self.CY
-
-        for idx in range(self.WAVE_COUNT):
-            height = self._wave_height(idx, state, level)
-            distance = start_gap + idx * spacing
-
-            left_x = self.CX - distance
-            right_x = self.CX + distance - bar_w
-            y0 = center_y - height / 2
-            y1 = center_y + height / 2
-
-            left_color = _lerp_color(LEFT_WAVE, "#ffffff", 0.1 + (1 - idx / self.WAVE_COUNT) * 0.25)
-            right_color = _lerp_color(RIGHT_WAVE, "#ffffff", 0.1 + (1 - idx / self.WAVE_COUNT) * 0.25)
-
-            c.create_rectangle(left_x - bar_w, y0, left_x, y1, fill=left_color, outline="")
-            c.create_rectangle(right_x, y0, right_x + bar_w, y1, fill=right_color, outline="")
-
-    def _draw_text_panel(self, c: tk.Canvas, accent: str, label: str, detail: str) -> None:
-        label_y = self.CY + self.ORB_R + 70
-        c.create_text(self.CX, label_y, text=label.upper(), fill=accent, font=("Segoe UI Semibold", 16), anchor="center")
-        c.create_text(self.CX, label_y + 24, text=detail[:64], fill=TEXT_SEC, font=("Segoe UI", 11), anchor="center")
-        c.create_text(self.CX, label_y + 48, text="Double-click to open control center", fill=_lerp_color(TEXT_SEC, accent, 0.25), font=("Segoe UI", 9), anchor="center")
-
-
-BottomOverlay = AssistantHud
+AssistantHud = EdgeAuraHud

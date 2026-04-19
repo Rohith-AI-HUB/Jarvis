@@ -121,6 +121,12 @@ class UnavailableVoiceInterface:
     def say(self, _: str) -> bool:
         return False
 
+    def is_speaking(self) -> bool:
+        return False
+
+    def stop_speaking(self) -> bool:
+        return False
+
     def capture_command(self, *_: Any, **__: Any) -> Any:
         raise RuntimeError(self.reason)
 
@@ -166,23 +172,42 @@ def startup_python_executable() -> Path:
     return Path(sys.executable)
 
 
+def startup_launcher_contents() -> str:
+    python_executable = startup_python_executable()
+    app_path = Path(__file__).resolve()
+    delay_ms = max(0, int(settings.startup_launch_delay_seconds * 1000))
+    command = f'"{python_executable}" "{app_path}" --tray'
+    lines = [
+        'Set shell = CreateObject("WScript.Shell")',
+        f'shell.CurrentDirectory = "{app_path.parent}"',
+    ]
+    if delay_ms:
+        lines.append(f"WScript.Sleep {delay_ms}")
+    lines.append(f'shell.Run "{command.replace(chr(34), chr(34) + chr(34))}", 0, False')
+    lines.append("")
+    return "\n".join(lines)
+
+
 def install_startup() -> Path:
     settings.startup_folder.mkdir(parents=True, exist_ok=True)
     if legacy_startup_script_path().exists():
         legacy_startup_script_path().unlink()
     script_path = startup_script_path()
-    python_executable = startup_python_executable()
-    app_path = Path(__file__).resolve()
-    command = f'"{python_executable}" "{app_path}" --tray'
-    launcher = "\n".join(
-        [
-            'Set shell = CreateObject("WScript.Shell")',
-            f'shell.CurrentDirectory = "{app_path.parent}"',
-            f'shell.Run "{command.replace(chr(34), chr(34) + chr(34))}", 0, False',
-            "",
-        ]
-    )
-    script_path.write_text(launcher, encoding="utf-8")
+    script_path.write_text(startup_launcher_contents(), encoding="utf-8")
+    return script_path
+
+
+def ensure_startup_installed() -> Path | None:
+    if not settings.startup_auto_install:
+        return None
+    settings.startup_folder.mkdir(parents=True, exist_ok=True)
+    if legacy_startup_script_path().exists():
+        legacy_startup_script_path().unlink()
+    script_path = startup_script_path()
+    expected = startup_launcher_contents()
+    current = script_path.read_text(encoding="utf-8") if script_path.exists() else ""
+    if current != expected:
+        script_path.write_text(expected, encoding="utf-8")
     return script_path
 
 
@@ -316,6 +341,15 @@ def run_command_text(
                 session_origin=session_origin,
                 voice_confirmation_handler=confirmation_handler,
             )
+            interrupted_command = str(result.get("interrupted_command", "")).strip()
+            if str(result.get("status", "")).lower() == "interrupted" and interrupted_command:
+                return run_command_text(
+                    interrupted_command,
+                    voice=voice,
+                    callbacks=callbacks,
+                    session_origin=session_origin,
+                    confirmation_handler=confirmation_handler,
+                )
             result["message"] = _natural_result_message(result)
             _remember_action_targets(result)
             _CONVERSATION.record_exchange(effective_command, result["message"], assistant_kind=result.get("status", "action"))
@@ -349,6 +383,15 @@ def run_command_text(
             session_origin=session_origin,
             voice_confirmation_handler=confirmation_handler,
         )
+        interrupted_command = str(result.get("interrupted_command", "")).strip()
+        if str(result.get("status", "")).lower() == "interrupted" and interrupted_command:
+            return run_command_text(
+                interrupted_command,
+                voice=voice,
+                callbacks=callbacks,
+                session_origin=session_origin,
+                confirmation_handler=confirmation_handler,
+            )
         result["message"] = _natural_result_message(result)
         _remember_action_targets(result)
         _CONVERSATION.record_exchange(effective_command, result["message"], assistant_kind=result.get("status", "action"))
@@ -627,7 +670,8 @@ class TrayAssistantRuntime:
         self._shutdown = threading.Event()
         self._busy_lock = threading.Lock()
         self._assistant_busy = False
-        self._deferred_wake = False
+        self._barge_in_requested = False
+        self._barge_in_source: str | None = None
         self._stop_event_handle: int | None = None
         self._wake_restart_attempts = 0
         self._wake_restart_lock = threading.Lock()
@@ -656,6 +700,10 @@ class TrayAssistantRuntime:
             turn_started_at = started_at
             first_turn = True
             while not self._shutdown.is_set():
+                pending_source = self._consume_barge_in()
+                if pending_source:
+                    source = pending_source
+                    first_turn = False
                 if source != "push_to_talk" or not first_turn:
                     if not self.voice.play_listening_cue():
                         LOGGER.warning("Listening cue unavailable.")
@@ -700,8 +748,18 @@ class TrayAssistantRuntime:
                     self.hud.set_state("complete", "Objective complete")
                 response_ready_at = time.perf_counter()
                 LOGGER.info("Voice command response time: %.3fs", response_ready_at - recognized_at)
+                if settings.wake_word_enabled and self.voice.available():
+                    self.voice.start_wake_listener(self._on_wake_detected, on_error=self._on_wake_error)
                 self.hud.on_complete(outcome)
                 speech_ok = self.voice.say(outcome)
+                self.voice.stop_wake_listener()
+                pending_source = self._consume_barge_in()
+                if pending_source:
+                    self.hud.set_state("listening", "Interrupted")
+                    turn_started_at = time.perf_counter()
+                    source = pending_source
+                    first_turn = False
+                    continue
                 if not speech_ok:
                     LOGGER.warning("Speech playback unavailable for response.")
                 if not _should_wait_for_follow_up(result):
@@ -726,7 +784,7 @@ class TrayAssistantRuntime:
 
     def _capture_voice_confirmation(self, prompt: str) -> str:
         self.hud.on_confirmation(prompt)
-        result = self.voice.capture_confirmation(level_callback=self.hud.on_listening)
+        result = self.voice.capture_command(level_callback=self.hud.on_listening)
         if result.ok:
             return result.text
         if result.status == "error":
@@ -734,15 +792,19 @@ class TrayAssistantRuntime:
         return ""
 
     def _release_busy(self) -> None:
-        should_run_deferred = False
         with self._busy_lock:
             self._assistant_busy = False
-            if self._deferred_wake and not self._shutdown.is_set():
-                self._deferred_wake = False
-                self._assistant_busy = True
-                should_run_deferred = True
-        if should_run_deferred:
-            threading.Thread(target=self._run_voice_command, args=("deferred",), daemon=True).start()
+            self._barge_in_requested = False
+            self._barge_in_source = None
+
+    def _consume_barge_in(self) -> str | None:
+        with self._busy_lock:
+            if not self._barge_in_requested:
+                return None
+            source = self._barge_in_source or "interrupt"
+            self._barge_in_requested = False
+            self._barge_in_source = None
+            return source
 
     def activate(self, source: str) -> bool:
         if not self.voice.available():
@@ -750,8 +812,11 @@ class TrayAssistantRuntime:
             return False
         with self._busy_lock:
             if self._assistant_busy:
-                if source == "wake_word":
-                    self._deferred_wake = True
+                if self.voice.is_speaking():
+                    self._barge_in_requested = True
+                    self._barge_in_source = source
+                    self.voice.stop_speaking()
+                    return True
                 return False
             self._assistant_busy = True
         threading.Thread(target=self._run_voice_command, args=(source,), daemon=True).start()
@@ -826,6 +891,10 @@ class TrayAssistantRuntime:
 
     def start(self) -> None:
         self.hud.on_idle()
+        try:
+            ensure_startup_installed()
+        except Exception:
+            LOGGER.exception("Failed to refresh startup launcher.")
         self._stop_event_handle = create_stop_event()
         if self._stop_event_handle:
             threading.Thread(target=self._monitor_external_stop, daemon=True).start()

@@ -22,6 +22,12 @@ class ExecutionError(RuntimeError):
     pass
 
 
+class ConfirmationInterruption(RuntimeError):
+    def __init__(self, command: str) -> None:
+        super().__init__(command)
+        self.command = command
+
+
 def explain_step(step: dict[str, Any]) -> str:
     return f"{step['tool']}.{step['operation']} with args {json.dumps(step.get('args', {}), ensure_ascii=True)}"
 
@@ -64,11 +70,15 @@ def confirm_step(
         first_decision = _parse_confirmation(first_answer)
         if first_decision is not None:
             return first_decision
+        if first_answer:
+            raise ConfirmationInterruption(first_answer)
         simplified_prompt = _simplified_confirmation_prompt(step)
         if speaker:
             speaker.say(f"I need a clear answer. {simplified_prompt}")
         second_answer = str(voice_confirmation_handler(simplified_prompt)).strip()
         second_decision = _parse_confirmation(second_answer)
+        if second_decision is None and second_answer:
+            raise ConfirmationInterruption(second_answer)
         return second_decision is True
 
     prompt_with_suffix = f"{prompt} [y/N]: "
@@ -148,12 +158,21 @@ def execute_plan(
         if session_origin == "voice" and risk == CONFIRM:
             requires_confirmation = True
         if requires_confirmation:
-            if not confirm_step(
-                step,
-                speaker=speaker,
-                session_origin=session_origin,
-                voice_confirmation_handler=voice_confirmation_handler,
-            ):
+            try:
+                confirmed = confirm_step(
+                    step,
+                    speaker=speaker,
+                    session_origin=session_origin,
+                    voice_confirmation_handler=voice_confirmation_handler,
+                )
+            except ConfirmationInterruption as exc:
+                return {
+                    "status": "interrupted",
+                    "message": "Received a new voice command during confirmation.",
+                    "results": results,
+                    "interrupted_command": exc.command,
+                }
+            if not confirmed:
                 return {
                     "status": "cancelled",
                     "message": f"Cancelled safely at step {step['operation']}",

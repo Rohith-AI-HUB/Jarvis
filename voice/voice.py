@@ -106,6 +106,8 @@ class SpeechRequest:
     text: str
     done: threading.Event | None = None
     ok: bool = False
+    cancel: threading.Event | None = None
+    interrupted: bool = False
 
 
 class VoiceInterface:
@@ -122,6 +124,9 @@ class VoiceInterface:
         self._speech_thread: threading.Thread | None = None
         self._speech_queue: queue.Queue[SpeechRequest | None] = queue.Queue()
         self._speech_backend = "none"
+        self._speech_active = threading.Event()
+        self._speech_interrupt = threading.Event()
+        self._current_speech_request: SpeechRequest | None = None
         self._wake_model: WakeModel | None = None
         self._whisper_model: WhisperModel | None = None
         self._groq_client = None
@@ -348,12 +353,21 @@ class VoiceInterface:
             return False
             
         success = True
+        request = self._current_speech_request
+        cancel = request.cancel if request else None
         for chunk in chunks:
+            if cancel and cancel.is_set():
+                if request:
+                    request.interrupted = True
+                return False
             audio_path = self._speech_cache_dir / f"{uuid.uuid4().hex}.wav"
             try:
                 with wave.open(str(audio_path), "wb") as wav_file:
                     voice.synthesize_wav(chunk, wav_file)
-                winsound.PlaySound(str(audio_path), winsound.SND_FILENAME)
+                if not self._play_generated_audio(audio_path, cancel):
+                    if request:
+                        request.interrupted = True
+                    return False
             except Exception as e:
                 LOGGER.error("Failed to play Piper speech: %s", e)
                 success = False
@@ -388,13 +402,22 @@ class VoiceInterface:
             return False
             
         success = True
+        request = self._current_speech_request
+        cancel = request.cancel if request else None
         for chunk in chunks:
+            if cancel and cancel.is_set():
+                if request:
+                    request.interrupted = True
+                return False
             response = None
             audio_path = self._speech_cache_dir / f"{uuid.uuid4().hex}.wav"
             try:
                 response = client.audio.speech.create(model=settings.groq_tts_model, voice=settings.groq_tts_voice, input=chunk, response_format="wav")
                 response.write_to_file(audio_path)
-                winsound.PlaySound(str(audio_path), winsound.SND_FILENAME)
+                if not self._play_generated_audio(audio_path, cancel):
+                    if request:
+                        request.interrupted = True
+                    return False
             except Exception as exc:
                 LOGGER.error("Failed to generate/play Groq speech: %s", exc)
                 success = False
@@ -414,6 +437,27 @@ class VoiceInterface:
         if success:
             self._set_speech_backend("groq")
         return success
+
+    def _play_generated_audio(self, audio_path: Path, cancel: threading.Event | None) -> bool:
+        if winsound is None:
+            raise RuntimeError(self._handle_dependency_error("winsound", "speech playback"))
+        try:
+            with wave.open(str(audio_path), "rb") as wav_file:
+                frames = wav_file.getnframes()
+                rate = wav_file.getframerate() or 1
+                duration = max(0.05, frames / float(rate))
+        except Exception:
+            duration = 0.6
+
+        winsound.PlaySound(str(audio_path), winsound.SND_FILENAME | winsound.SND_ASYNC)
+        started = time.monotonic()
+        while time.monotonic() - started < duration:
+            if cancel and cancel.is_set():
+                winsound.PlaySound(None, winsound.SND_PURGE)
+                return False
+            time.sleep(0.02)
+        winsound.PlaySound(None, winsound.SND_PURGE)
+        return True
 
     def _speech_loop(self) -> None:
         engine = None
@@ -442,6 +486,9 @@ class VoiceInterface:
             if request is None:
                 break
             try:
+                self._current_speech_request = request
+                self._speech_active.set()
+                self._speech_interrupt.clear()
                 if preferred_backend == "piper" and self._piper_available():
                     request.ok = self._play_with_piper(request.text)
                 elif preferred_backend == "groq" and self._groq_tts_available():
@@ -450,7 +497,8 @@ class VoiceInterface:
                     try:
                         engine.say(request.text)
                         engine.runAndWait()
-                        request.ok = True
+                        request.ok = not (request.cancel and request.cancel.is_set())
+                        request.interrupted = bool(request.cancel and request.cancel.is_set())
                         self._set_speech_backend("pyttsx3")
                     except Exception:
                         LOGGER.exception("Speech playback failed.")
@@ -470,7 +518,8 @@ class VoiceInterface:
                         if engine is not None:
                             engine.say(request.text)
                             engine.runAndWait()
-                            request.ok = True
+                            request.ok = not (request.cancel and request.cancel.is_set())
+                            request.interrupted = bool(request.cancel and request.cancel.is_set())
                             self._set_speech_backend("pyttsx3")
                         elif self._piper_available():
                             request.ok = self._play_with_piper(request.text)
@@ -486,7 +535,8 @@ class VoiceInterface:
                     engine = self._init_local_engine()
                     engine.say(request.text)
                     engine.runAndWait()
-                    request.ok = True
+                    request.ok = not (request.cancel and request.cancel.is_set())
+                    request.interrupted = bool(request.cancel and request.cancel.is_set())
                     self._set_speech_backend("pyttsx3")
                 else:
                     raise RuntimeError("Speech engine is unavailable.")
@@ -502,6 +552,9 @@ class VoiceInterface:
                 engine = None
                 self._set_speech_backend("none")
             finally:
+                self._current_speech_request = None
+                self._speech_active.clear()
+                self._speech_interrupt.clear()
                 if request.done:
                     request.done.set()
 
@@ -529,6 +582,7 @@ class VoiceInterface:
             self._speech_thread = thread
 
     def reset_speech(self) -> None:
+        self.stop_speaking()
         self._speech_stop.set()
         with self._speech_lock:
             thread = self._speech_thread
@@ -563,7 +617,7 @@ class VoiceInterface:
         if not self._speech_thread or not self._speech_thread.is_alive():
             return False
         done = threading.Event() if wait else None
-        request = SpeechRequest(text=message, done=done)
+        request = SpeechRequest(text=message, done=done, cancel=threading.Event())
         self._speech_queue.put(request)
         if done:
             if not done.wait(timeout=settings.speech_timeout_seconds):
@@ -572,12 +626,39 @@ class VoiceInterface:
                     self.reset_speech()
                     return self.say("I had trouble speaking that response.", wait=wait, retry_on_timeout=False)
                 return False
+            if request.interrupted:
+                return False
             if not request.ok and retry_on_timeout:
                 LOGGER.warning("Speech playback failed; retrying with fallback message.")
                 self.reset_speech()
                 return self.say("I had trouble speaking that response.", wait=wait, retry_on_timeout=False)
             return request.ok
         return True
+
+    def is_speaking(self) -> bool:
+        return self._speech_active.is_set()
+
+    def stop_speaking(self) -> bool:
+        interrupted = False
+        self._speech_interrupt.set()
+        request = self._current_speech_request
+        if request and request.cancel:
+            request.cancel.set()
+            request.interrupted = True
+            interrupted = True
+        if self.engine is not None:
+            try:
+                self.engine.stop()
+                interrupted = True
+            except Exception:
+                LOGGER.debug("Failed to stop pyttsx3 speech cleanly.", exc_info=True)
+        if winsound is not None:
+            try:
+                winsound.PlaySound(None, winsound.SND_PURGE)
+                interrupted = True or interrupted
+            except Exception:
+                LOGGER.debug("Failed to purge winsound playback cleanly.", exc_info=True)
+        return interrupted
 
     def play_listening_cue(self) -> bool:
         if winsound is not None:
@@ -869,6 +950,7 @@ class VoiceInterface:
 
     def shutdown(self) -> None:
         self.stop_wake_listener()
+        self.stop_speaking()
         self._speech_stop.set()
         with self._speech_lock:
             thread = self._speech_thread

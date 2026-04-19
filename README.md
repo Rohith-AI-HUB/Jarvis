@@ -1,197 +1,95 @@
-# 🔴 Jarvis - Your Personal AI Assistant
+# Jarvis - Your Personal AI Assistant
 
-**A Windows-first local AI agent runtime with voice controls, persistent memory, and safe execution**
+Windows-first local AI agent runtime with voice controls, persistent memory, and guarded execution.
 
-[Features](#-features) • [Quick Start](#-quick-start) • [Installation](#-installation) • [Usage](#-usage) • [Architecture](#-architecture)
+## Features
 
-## ✨ Features
+### Core Capabilities
 
-### 🎯 Core Capabilities
+- Local-first runtime with Ollama or Groq integration
+- Automatic provider fallback between Ollama and Groq
+- Voice-first interaction with wake word detection
+- Persistent memory for conversation and user preferences
+- Guarded execution for system-changing actions
+- System tray runtime with quick controls
 
-- **Local Everything** — No cloud dependencies, runs fully on your machine
-- **Voice-First Interface** — Wake word detection with `Hey Jarvis`
-- **Persistent Memory** — Remembers conversations and user preferences
-- **Safe Execution** — Guarded action execution with user confirmation
-- **Ollama/Groq Integration** — Choose your preferred LLM backend
-- **System Tray App** — Always accessible with quick controls
+### User Experience
 
-### 🎨 User Experience
+- Edge Aura HUD with a clearly visible persistent border on all four screen edges
+- Control Center for runtime monitoring and diagnostics
+- Voice, typed, and direct command execution modes
+- Natural follow-ups with speech interruption support
 
-- **Summon HUD** — Centered overlay for quick commands
-- **Control Center** — Runtime monitoring and diagnostics
-- **Interactive Modes** — Voice, typed, or direct command execution
-- **Natural Conversations** — Context-aware follow-ups
+### Technical Stack
 
-### 🔧 Technical Excellence
+- Faster Whisper STT
+- OpenWakeWord detection
+- Piper, pyttsx3, or Groq-backed TTS
+- Semantic memory and conversation history
+- Windows startup integration
 
-- **FAISS Semantic Memory** — Efficient semantic search and retrieval
-- **Faster Whisper STT** — Fast speech-to-text
-- **OpenWakeWord Detection** — Wake word recognition
-- **Piper TTS** — Text-to-speech responses
-- **Startup Integration** — Auto-launch on Windows login
-
-## 🚀 Quick Start
+## Quick Start
 
 ```bash
-# Clone and setup
-git clone <repo-url>
-cd Jarvis
-
 python -m venv .venv
 .venv\Scripts\activate
-
 pip install -r requirements.txt
-
-# Get Ollama ready
 ollama pull llama3.1:8b
-
-# Launch Jarvis in voice mode
 python app.py --voice
 ```
 
-**Say "Hey Jarvis, what can you do?" to get started!**
+Say `Hey Jarvis, what can you do?` to start, and interrupt Jarvis mid-response to ask a follow-up.
 
-## 📦 Installation
-
-### Prerequisites
-
-- Python 3.10+
-- Windows 10/11
-- Ollama (for local LLM) or Groq API key
-
-### Step-by-Step Setup
-
-1. **Create Virtual Environment**
-   ```bash
-   python -m venv .venv
-   .venv\Scripts\activate
-   ```
-2. **Install Dependencies**
-   ```bash
-   pip install -r requirements.txt
-   ```
-3. **Get LLM Model**
-   ```bash
-   ollama pull llama3.1:8b
-   ```
-4. **First Launch**
-   ```bash
-   python app.py
-   ```
-   > **Note:** First launch will automatically download voice models (~100MB total)
-
-## 🎮 Usage
-
-### Launch Modes
+## Usage
 
 | Command | Mode | Description |
 | --- | --- | --- |
 | `python app.py` | Tray | Default persistent tray mode |
-| `python app.py --voice` | Voice | Voice-first interactive mode |
+| `python app.py --voice` | Voice | Voice-first tray runtime |
 | `python app.py --interactive` | Interactive | Typed command prompt |
-| `python app.py "open chrome"` | Direct | Execute single command |
+| `python app.py "open chrome"` | Direct | Execute a single command |
 | `python app.py --tray` | Tray | Explicit tray mode |
 
-### 🎤 Voice Commands
-
-#### Basic Interactions
+### Example Voice Commands
 
 ```text
 Hey Jarvis, open Chrome
-Hey Jarvis, what's the weather?
-Hey Jarvis, my name is Rohit
-Hey Jarvis, remember this
+Hey Jarvis, focus Notepad
+Hey Jarvis, type hello world in Notepad
+Hey Jarvis, press control l in Chrome
+Hey Jarvis, maximize VS Code
 Hey Jarvis, what do you remember?
 ```
 
-#### System Control
-
-```text
-Hey Jarvis, open Notepad
-Hey Jarvis, open VS Code
-Hey Jarvis, check system health
-Hey Jarvis, fix yourself
-```
-
-#### Memory Management
-
-```text
-Hey Jarvis, when I say code editor I mean VS Code
-Hey Jarvis, forget that
-Hey Jarvis, clear memory
-```
-
-## 🏗️ Architecture
+## Architecture
 
 ### Project Structure
 
 ```text
 Jarvis/
-├── core/
-│   ├── planner.py
-│   ├── executor.py
-│   ├── agents.py
-│   ├── conversation.py
-│   └── capabilities.py
-├── interface/
-│   ├── control_center.py
-│   ├── overlay.py
-│   └── theme.py
-├── voice/
-│   ├── voice.py
-│   └── transcript.py
-├── system/
-│   ├── tools.py
-│   ├── config.py
-│   ├── diagnostics.py
-│   ├── health.py
-│   └── mcp_runtime.py
-├── memory/
-│   ├── semantic/
-│   ├── conversation_history.json
-│   └── profile.json
-├── voice_models/
-├── logs/
-├── app.py
-└── requirements.txt
+|- core/
+|- interface/
+|- voice/
+|- system/
+|- memory/
+|- logs/
+|- app.py
+`- requirements.txt
 ```
 
-### Data Flow
+### Runtime Flow
 
 ```text
-Voice Input ─► Wake Detection ─► STT ─► Transcript Normalization
-                                              │
-                                              ▼
-User Input  ───────► Planner ───► Executor ───► Tools
-                                              │
-                                              ▼
-TTS Output  ◄─────── Result  ◄─── Execution ◄── Confirmation
-                                              │
-                                              ▼
-                                        Memory Update
+Voice Input -> Wake Detection -> STT -> Transcript Normalization
+User Input  -> Planner -> Executor -> Tools
+TTS Output  <- Result <- Execution <- Confirmation
+      ^
+      |-- User barge-in can interrupt speech and begin a new follow-up
 ```
 
-## 🛠️ Configuration
+## Notes
 
-Edit `system/config.py` to customize:
-
-- LLM provider (Ollama/Groq) and model
-- Hotkeys and shortcuts
-- Allowed terminal commands
-- Voice model paths
-- Memory settings
-
-## 🔒 Security
-
-- All processing happens locally
-- No data sent externally (unless using Groq)
-- Environment variables stored in `.env`
-- Guarded execution prevents accidental damage
-
-## 📝 License
-
-MIT License — free to use and modify
-
-Made with ❤️ for Windows
-
-Built for productivity, powered by AI
+- The current HUD is single-monitor oriented.
+- Set `JARVIS_HUD_DEBUG_VISIBLE=true` to force a brighter high-contrast border for visibility testing.
+- In-app work focuses on opening/focusing apps, typing text, sending shortcuts, and window controls.
+- Arbitrary screen clicking remains out of the default voice workflow.

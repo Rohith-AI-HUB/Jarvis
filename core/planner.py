@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import re
 from datetime import datetime, timezone
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
 import requests
 
@@ -72,6 +72,8 @@ _LAST_PLANNER_STATUS: dict[str, Any] = {
     "updated_at": "",
 }
 
+SUPPORTED_PROVIDERS = ("ollama", "groq")
+
 Intent = Literal["social", "question", "conversation", "action", "empty"]
 
 QUESTION_PREFIXES = (
@@ -82,7 +84,8 @@ QUESTION_PREFIXES = (
 ACTION_HINTS = (
     "open ", "launch ", "start ", "run ", "search ", "search for ",
     "google search ", "focus ", "list ", "show ", "find ", "delete ",
-    "move ", "copy ", "rename ",
+    "move ", "copy ", "rename ", "type ", "press ", "maximize ",
+    "minimize ", "restore ",
 )
 
 SOCIAL_PREFIXES = (
@@ -134,6 +137,52 @@ def _record_planner_status(ok: bool, provider: str, stage: str, message: str) ->
 
 def get_planner_status() -> dict[str, Any]:
     return dict(_LAST_PLANNER_STATUS)
+
+
+def _configured_provider() -> str:
+    provider = settings.planner_provider.strip().lower()
+    if provider in {"", "auto"}:
+        return "auto"
+    if provider in SUPPORTED_PROVIDERS:
+        return provider
+    return "auto"
+
+
+def _provider_available(provider: str) -> bool:
+    if provider == "groq":
+        return Groq is not None and bool(settings.groq_api_key)
+    if provider == "ollama":
+        return bool(settings.ollama_base_url and settings.ollama_model)
+    return False
+
+
+def _provider_order() -> list[str]:
+    configured = _configured_provider()
+    if configured == "groq":
+        ordered = ["groq", "ollama"]
+    elif configured == "ollama":
+        ordered = ["ollama", "groq"]
+    else:
+        ordered = ["ollama", "groq"]
+    return [provider for provider in ordered if _provider_available(provider)]
+
+
+def _run_with_provider_fallback(stage: str, provider_actions: dict[str, Callable[[], Any]]) -> tuple[Any, str]:
+    errors: list[str] = []
+    for provider in _provider_order():
+        action = provider_actions.get(provider)
+        if action is None:
+            continue
+        try:
+            result = action()
+            _record_planner_status(True, provider, stage, f"{stage} succeeded via {provider}.")
+            return result, provider
+        except PlannerError as exc:
+            errors.append(f"{provider}: {exc}")
+            continue
+    message = "; ".join(errors) if errors else "No configured provider is available."
+    _record_planner_status(False, "fallback", stage, message)
+    raise PlannerError(message)
 
 
 def _looks_like_action(text: str) -> bool:
@@ -231,6 +280,10 @@ def _recent_conversation_block(recent_turns: list[dict[str, str]] | None) -> str
 
 def _heuristic_plan(user_input: str) -> dict[str, Any] | None:
     text = user_input.lower().strip()
+
+    app_action_plan = _app_workflow_plan(text)
+    if app_action_plan:
+        return app_action_plan
 
     mcp_plan = _mcp_heuristic_plan(text)
     if mcp_plan:
@@ -421,6 +474,133 @@ def _heuristic_plan(user_input: str) -> dict[str, Any] | None:
     return None
 
 
+def _split_app_target(value: str) -> tuple[str, str | None]:
+    target = value.strip()
+    for marker in (" in ", " on ", " inside "):
+        if marker in target:
+            left, right = target.rsplit(marker, 1)
+            left = left.strip()
+            right = right.strip()
+            if left and right:
+                return left, right
+    return target, None
+
+
+def _normalize_key_token(token: str) -> str:
+    alias_map = {
+        "control": "ctrl",
+        "ctrl": "ctrl",
+        "command": "win",
+        "windows": "win",
+        "escape": "esc",
+        "return": "enter",
+        "spacebar": "space",
+    }
+    normalized = re.sub(r"[^a-z0-9+]", "", token.lower())
+    return alias_map.get(normalized, normalized)
+
+
+def _parse_shortcut_keys(text: str) -> list[str]:
+    parts = re.split(r"(?:\s*\+\s*|\s+then\s+|\s+and\s+|\s+)", text.strip())
+    keys = [_normalize_key_token(part) for part in parts if _normalize_key_token(part)]
+    if len(keys) == 2 and keys[0] == "press":
+        return [keys[1]]
+    return [key for key in keys if key != "press"]
+
+
+def _app_workflow_plan(text: str) -> dict[str, Any] | None:
+    type_match = re.match(r"type\s+(.+)", text)
+    if type_match:
+        payload, app_name = _split_app_target(type_match.group(1))
+        if payload:
+            steps: list[dict[str, Any]] = []
+            if app_name:
+                steps.append(
+                    {
+                        "tool": "system",
+                        "operation": "focus_app",
+                        "args": {"name": app_name},
+                        "requires_confirmation": False,
+                        "reason": f"Focus {app_name} before typing.",
+                    }
+                )
+            steps.append(
+                {
+                    "tool": "system",
+                    "operation": "type_text",
+                    "args": {"text": payload.strip("\"' ")},
+                    "requires_confirmation": False,
+                    "reason": "Type text into the active app.",
+                }
+            )
+            return {"plan": steps, "needs_clarification": False, "clarification_question": ""}
+
+    press_match = re.match(r"press\s+(.+)", text)
+    if press_match:
+        payload, app_name = _split_app_target(press_match.group(1))
+        keys = _parse_shortcut_keys(payload)
+        if keys:
+            steps = []
+            if app_name:
+                steps.append(
+                    {
+                        "tool": "system",
+                        "operation": "focus_app",
+                        "args": {"name": app_name},
+                        "requires_confirmation": False,
+                        "reason": f"Focus {app_name} before sending keys.",
+                    }
+                )
+            steps.append(
+                {
+                    "tool": "system",
+                    "operation": "press_keys",
+                    "args": {"keys": keys if len(keys) > 1 else keys[0]},
+                    "requires_confirmation": False,
+                    "reason": "Send shortcut keys to the active app.",
+                }
+            )
+            return {"plan": steps, "needs_clarification": False, "clarification_question": ""}
+
+    for prefix, operation in (("maximize ", "maximize_window"), ("minimize ", "minimize_window"), ("restore ", "restore_window")):
+        if text.startswith(prefix):
+            title = text[len(prefix):].strip()
+            if title:
+                return {
+                    "plan": [
+                        {
+                            "tool": "window",
+                            "operation": operation,
+                            "args": {"title": title},
+                            "requires_confirmation": False,
+                            "reason": f"{operation.replace('_', ' ').title()} for {title}.",
+                        }
+                    ],
+                    "needs_clarification": False,
+                    "clarification_question": "",
+                }
+
+    focus_match = re.match(r"(?:focus|switch to)\s+(.+)", text)
+    if focus_match:
+        app_name = focus_match.group(1).strip()
+        if app_name:
+            return {
+                "plan": [
+                    {
+                        "tool": "system",
+                        "operation": "focus_app",
+                        "args": {"name": app_name},
+                        "requires_confirmation": False,
+                        "reason": f"Focus the {app_name} window.",
+                    }
+                ],
+                "needs_clarification": False,
+                "clarification_question": "",
+            }
+
+    return None
+
+
 def _mcp_heuristic_plan(text: str) -> dict[str, Any] | None:
     if text in {"list mcp servers", "show mcp servers", "what mcp servers are available"}:
         return {"plan": [{"tool": "mcp", "operation": "list_servers", "args": {}, "requires_confirmation": False, "reason": "List configured MCP servers."}], "needs_clarification": False, "clarification_question": ""}
@@ -595,27 +775,30 @@ def _answer_with_groq_conversation(user_input: str, memory_lines: list[str] | No
 
 
 def answer_question(user_input: str) -> str:
-    provider = "groq" if settings.planner_provider == "groq" or (not settings.planner_provider and settings.groq_api_key) else "ollama"
     try:
-        answer = _answer_with_groq(user_input) if provider == "groq" else _answer_with_ollama(user_input)
-        _record_planner_status(True, provider, "answer_question", "Answered successfully.")
+        answer, _provider = _run_with_provider_fallback(
+            "answer_question",
+            {
+                "ollama": lambda: _answer_with_ollama(user_input),
+                "groq": lambda: _answer_with_groq(user_input),
+            },
+        )
         return answer
     except PlannerError as exc:
-        _record_planner_status(False, provider, "answer_question", str(exc))
         raise
 
 
 def answer_conversation(user_input: str, memory_lines: list[str] | None = None, recent_turns: list[dict[str, str]] | None = None) -> str:
-    provider = "groq" if settings.planner_provider == "groq" or (not settings.planner_provider and settings.groq_api_key) else "ollama"
     try:
-        if provider == "groq":
-            answer = _answer_with_groq_conversation(user_input, memory_lines=memory_lines, recent_turns=recent_turns)
-        else:
-            answer = _answer_with_ollama_conversation(user_input, memory_lines=memory_lines, recent_turns=recent_turns)
-        _record_planner_status(True, provider, "answer_conversation", "Answered successfully.")
+        answer, _provider = _run_with_provider_fallback(
+            "answer_conversation",
+            {
+                "ollama": lambda: _answer_with_ollama_conversation(user_input, memory_lines=memory_lines, recent_turns=recent_turns),
+                "groq": lambda: _answer_with_groq_conversation(user_input, memory_lines=memory_lines, recent_turns=recent_turns),
+            },
+        )
         return answer
     except PlannerError as exc:
-        _record_planner_status(False, provider, "answer_conversation", str(exc))
         text = user_input.strip().lower()
         if _looks_social(text):
             return answer_social(text)
@@ -627,13 +810,16 @@ def plan_command(user_input: str) -> dict[str, Any]:
     if h_plan:
         _record_planner_status(True, "heuristic", "plan_command", "Matched heuristic planner.")
         return h_plan
-    provider = "groq" if settings.planner_provider == "groq" or (not settings.planner_provider and settings.groq_api_key) else "ollama"
     try:
-        plan = _plan_with_groq(user_input) if provider == "groq" else _plan_with_ollama(user_input)
-        _record_planner_status(True, provider, "plan_command", "Plan created successfully.")
+        plan, _provider = _run_with_provider_fallback(
+            "plan_command",
+            {
+                "ollama": lambda: _plan_with_ollama(user_input),
+                "groq": lambda: _plan_with_groq(user_input),
+            },
+        )
         return plan
     except Exception as exc:
-        _record_planner_status(False, provider, "plan_command", str(exc))
         return {
             "plan": [],
             "needs_clarification": True,

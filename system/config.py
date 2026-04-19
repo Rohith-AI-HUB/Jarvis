@@ -82,6 +82,12 @@ class Settings:
     semantic_chunk_overlap: int = int(os.getenv("JARVIS_SEMANTIC_CHUNK_OVERLAP", "1"))
     startup_folder: Path = Path(os.getenv("APPDATA", "")) / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup"
     startup_script_name: str = os.getenv("JARVIS_STARTUP_SCRIPT_NAME", "jarvis-startup.vbs")
+    startup_auto_install: bool = os.getenv("JARVIS_STARTUP_AUTO_INSTALL", "true").lower() == "true"
+    startup_launch_delay_seconds: float = float(os.getenv("JARVIS_STARTUP_LAUNCH_DELAY_SECONDS", "8"))
+    hud_edge_thickness: int = int(os.getenv("JARVIS_HUD_EDGE_THICKNESS", "26"))
+    hud_edge_inset: int = int(os.getenv("JARVIS_HUD_EDGE_INSET", "8"))
+    hud_debug_visible: bool = os.getenv("JARVIS_HUD_DEBUG_VISIBLE", "false").lower() == "true"
+    hud_startup_pulse_seconds: float = float(os.getenv("JARVIS_HUD_STARTUP_PULSE_SECONDS", "2.5"))
     allowed_terminal_commands: tuple[str, ...] = (
         "git status",
         "git pull",
